@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+
+# AI session artefacts (local-only, never commit)
+.claude/
+.planning/
+.company/
+COMPANY.md
+CLAUDE.md
+.cursor/
+.gemini/
+.codex/
+.copilot/
+
+# Secrets
+.github_token
+.env
+.env.*
+!.env.example
