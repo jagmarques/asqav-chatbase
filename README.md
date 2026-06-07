@@ -4,7 +4,7 @@
 
 # asqav-chatbase
 
-Stop a rogue agent before it acts, and prove what it tried. This package is a proxy connector for [Chatbase](https://www.chatbase.co) Custom Actions. Point a Chatbase Custom Action at it, and it signs the intended action through Asqav before forwarding to your real API. If Asqav refuses, the downstream is never called and a blocked JSON response is returned. Every attempt becomes a tamper-evident receipt signed server-side with NIST FIPS 204 ML-DSA-65, so the agent can never forge the record and never holds the signing key.
+Stop a rogue agent before it acts, and prove what it tried. This package is a proxy connector for [Chatbase](https://www.chatbase.co) Custom Actions. Point a Chatbase Custom Action at it, and it signs the intended action through Asqav before forwarding to your real API. If Asqav refuses, the downstream is never called and the connector returns a blocked JSON response. Every attempt becomes a tamper-evident receipt, signed server-side with NIST FIPS 204 ML-DSA-65. The agent never holds the signing key, so it cannot forge the record.
 
 This is a sign-then-forward pre-execution gate. Signing happens before the downstream runs, so a refused action never executes.
 
