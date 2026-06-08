@@ -10,7 +10,7 @@ This is a sign-then-forward pre-execution gate. Signing happens before the downs
 
 ## How it hooks in
 
-A Chatbase Custom (API) Action sends an HTTP request (GET, POST, PUT, or DELETE) to a developer-defined HTTPS endpoint, injecting the variables the agent collected from the user into the URL or the JSON body. Custom headers are supported, and the endpoint must return JSON (maximum 20KB). This connector is that endpoint: it signs the inbound action and, when allowed, forwards the same body to your real downstream URL and relays its JSON back to Chatbase.
+A Chatbase Custom API Action sends an HTTP request, with a method of GET, POST, PUT, or DELETE, to a developer-defined HTTPS endpoint, injecting the variables the agent collected from the user into the URL or the JSON body. Custom headers are supported, and the endpoint must return JSON up to 20KB. This connector is that endpoint: it signs the inbound action and, when allowed, forwards the same body to your real downstream URL and relays its JSON back to Chatbase.
 
 ```
 Chatbase  ->  this handler  --sign-->  Asqav
@@ -18,7 +18,7 @@ Chatbase  ->  this handler  --sign-->  Asqav
                     |  refused  -> return { blocked: true, ... } (no forward)
 ```
 
-Reference (cold-verified): [Chatbase Custom Action docs](https://www.chatbase.co/docs/user-guides/chatbot/actions/custom-action).
+Reference, cold-verified: [Chatbase Custom Action docs](https://www.chatbase.co/docs/user-guides/chatbot/actions/custom-action).
 
 ## Install
 
@@ -37,7 +37,7 @@ npm install github:jagmarques/asqav-chatbase
 }
 ```
 
-## Quick start (Express)
+## Quick start with Express
 
 ```ts
 import express from "express";
@@ -64,12 +64,12 @@ app.listen(3000);
 
 ## Point Chatbase at it
 
-1. In your Chatbase agent, add a Custom (API) Action.
+1. In your Chatbase agent, add a Custom API Action.
 2. Set the action URL to your deployed handler, for example `https://gate.yourapp.com/asqav/refund`.
-3. Set the method to `POST` and define the variables the agent collects from the user (they arrive in the JSON body).
+3. Set the method to `POST` and define the variables the agent collects from the user. They arrive in the JSON body.
 4. The handler signs the action, forwards the body to `downstreamUrl`, and returns the downstream JSON. A refused action returns `{ "blocked": true, ... }` so the agent sees the block.
 
-## Serverless (any framework)
+## Serverless with any framework
 
 Use the framework-agnostic core directly:
 
@@ -90,13 +90,13 @@ export async function POST(request: Request) {
 
 `handleChatbaseAction(req, options)` and `expressHandler(options)` accept:
 
-- `agent` (required): a pre-built Asqav `Agent` from `@asqav/sdk`.
-- `downstreamUrl` (required): your real API this action gates.
+- `agent`, required: a pre-built Asqav `Agent` from `@asqav/sdk`.
+- `downstreamUrl`, required: your real API this action gates.
 - `actionName`: the name on the signed receipt and the action_type suffix. Defaults to `"chatbase_action"`.
 - `forwardMethod`: method used when forwarding. Defaults to the inbound method, or `POST`.
-- `downstreamHeaders`: extra headers sent to your downstream (for example an auth token).
+- `downstreamHeaders`: extra headers sent to your downstream, such as an auth token.
 - `preflight`: a custom `(actionType, body) => { allowed, reason }` check. Defaults to `agent.preflight`.
-- `failClosed` (default `true`): block the action when a signing transport error occurs. A proxy connector sits on the action path, so the safe default is to refuse when governance is unreachable. Set `false` to fail-open.
+- `failClosed`, defaulting to `true`: block the action when a signing transport error occurs. A proxy connector sits on the action path, so the safe default is to refuse when governance is unreachable. Set `false` to fail-open.
 - `onError`: sink for signing transport errors. Defaults to `console.warn`.
 
 ## License
