@@ -9,8 +9,14 @@
  * blocked JSON response is returned: stop a rogue agent before it acts, and
  * prove what it tried.
  *
- * Flow (sign-then-forward = pre-execution gate):
- *   Chatbase  ->  this handler  --sign-->  Asqav
+ * The handler holds the real downstream credentials, so it first verifies an
+ * operator-set shared secret on the inbound request. An unverified caller is
+ * refused before anything is signed or forwarded, which stops the endpoint
+ * from becoming a confused deputy for those credentials.
+ *
+ * Flow (verify-then-sign-then-forward = pre-execution gate):
+ *   Chatbase  --secret-->  this handler  --sign-->  Asqav
+ *                       |  unverified -> return { blocked: true, ... } (no sign, no forward)
  *                       |  allowed -> forward to downstream -> return its JSON
  *                       |  refused -> return { blocked: true, ... } (no forward)
  *
@@ -27,6 +33,7 @@
  * configured downstream.
  */
 
+import { createHash, timingSafeEqual } from "node:crypto";
 import { Agent } from "@asqav/sdk";
 
 /** A framework-agnostic view of the inbound Chatbase request. Adapt your web
@@ -74,6 +81,20 @@ export interface AsqavChatbaseOptions {
    */
   downstreamHeaders?: Record<string, string>;
   /**
+   * Shared secret the inbound caller must present so the connector knows the
+   * request is your Chatbase action and not a stranger who found the URL.
+   * Falls back to `ASQAV_CHATBASE_INBOUND_SECRET`. REQUIRED: with no secret
+   * the handler fails closed and forwards nothing, so this endpoint cannot be
+   * deployed as an open confused deputy for your downstream credentials.
+   */
+  inboundSecret?: string;
+  /**
+   * Header that carries `inboundSecret`, looked up case-insensitively.
+   * Defaults to `x-asqav-connector-secret`. Configure your Chatbase Custom
+   * Action to send this header with the shared secret as its value.
+   */
+  inboundSecretHeader?: string;
+  /**
    * Optional preflight before signing. When it returns `allowed: false`, the
    * action is blocked without signing a permit. Defaults to `agent.preflight`.
    */
@@ -100,6 +121,88 @@ export interface GuardDecision {
 function defaultOnError(err: unknown, ctx: { actionName: string }): void {
   // eslint-disable-next-line no-console
   console.warn(`[asqav/chatbase] sign failed for action '${ctx.actionName}':`, err);
+}
+
+/** Default header carrying the inbound shared secret. */
+const DEFAULT_INBOUND_HEADER = "x-asqav-connector-secret";
+
+/**
+ * Read one request header case-insensitively. Returns the single string value,
+ * or undefined when the header is absent or carries multiple values (an
+ * ambiguous secret is treated as missing).
+ */
+function readHeader(
+  headers: Record<string, string | string[] | undefined> | undefined,
+  name: string,
+): string | undefined {
+  if (!headers) return undefined;
+  const target = name.toLowerCase();
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() !== target) continue;
+    const value = headers[key];
+    if (typeof value === "string") return value;
+    if (Array.isArray(value) && value.length === 1 && typeof value[0] === "string") {
+      return value[0];
+    }
+    return undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Constant-time secret comparison. Both sides are SHA-256 hashed first so the
+ * compare is over fixed 32-byte digests: no length is leaked and the timing
+ * does not depend on how many leading characters match.
+ */
+function secretsMatch(provided: string, expected: string): boolean {
+  const a = createHash("sha256").update(provided).digest();
+  const b = createHash("sha256").update(expected).digest();
+  return timingSafeEqual(a, b);
+}
+
+/**
+ * Verify the inbound caller before anything is signed or forwarded. Returns a
+ * rejection response when verification fails, or null when the caller may
+ * proceed.
+ *
+ * Fail-closed by design: when no secret is configured (neither `inboundSecret`
+ * nor `ASQAV_CHATBASE_INBOUND_SECRET`) every request is refused, so the
+ * connector can never forward the operator's downstream credentials on behalf
+ * of an unauthenticated caller (the confused-deputy hole).
+ */
+function verifyInbound(
+  req: ChatbaseRequest,
+  options: AsqavChatbaseOptions,
+  actionName: string,
+  onError: (err: unknown, ctx: { actionName: string }) => void,
+): ChatbaseResponse | null {
+  const secret = options.inboundSecret ?? process.env.ASQAV_CHATBASE_INBOUND_SECRET;
+  if (!secret) {
+    onError(new Error("inbound verification secret not configured"), { actionName });
+    return {
+      status: 500,
+      body: {
+        blocked: true,
+        action: actionName,
+        error: "inbound_verification_unconfigured",
+        message: "Asqav connector refuses to run: no inbound verification secret is configured",
+      },
+    };
+  }
+  const headerName = options.inboundSecretHeader ?? DEFAULT_INBOUND_HEADER;
+  const provided = readHeader(req.headers, headerName);
+  if (!provided || !secretsMatch(provided, secret)) {
+    return {
+      status: 401,
+      body: {
+        blocked: true,
+        action: actionName,
+        error: "inbound_verification_failed",
+        message: `Asqav connector rejected action '${actionName}': inbound verification failed`,
+      },
+    };
+  }
+  return null;
 }
 
 async function runPreflight(
@@ -140,6 +243,11 @@ export async function handleChatbaseAction(
   const onError = options.onError ?? defaultOnError;
   const fetchImpl = options.fetchImpl ?? fetch;
   const failClosed = options.failClosed !== false;
+
+  // 0. Verify the inbound caller before any preflight, signing, or forward.
+  //    An unverified caller is refused here and never reaches the downstream.
+  const rejected = verifyInbound(req, options, actionName, onError);
+  if (rejected) return rejected;
 
   // 1. Optional preflight: a hard deny blocks before any permit signs.
   const pre = await runPreflight(options, actionType, body);
