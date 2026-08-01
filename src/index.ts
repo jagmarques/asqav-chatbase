@@ -244,15 +244,15 @@ export async function handleChatbaseAction(
   const fetchImpl = options.fetchImpl ?? fetch;
   const failClosed = options.failClosed !== false;
 
-  // 0. Verify the inbound caller before any preflight, signing, or forward.
+  // Verify the inbound caller before any preflight, signing, or forward.
   //    An unverified caller is refused here and never reaches the downstream.
   const rejected = verifyInbound(req, options, actionName, onError);
   if (rejected) return rejected;
 
-  // 1. Optional preflight: a hard deny blocks before any permit signs.
+  // Optional preflight: a hard deny blocks before any permit signs.
   const pre = await runPreflight(options, actionType, body);
 
-  // 2. Sign the intended action. The receipt records what the agent tried,
+  // Sign the intended action. The receipt records what the agent tried,
   //    before the downstream runs.
   try {
     await options.agent.sign({
@@ -269,13 +269,13 @@ export async function handleChatbaseAction(
     // fail-open: fall through and forward.
   }
 
-  // 3. Block: refused action never reaches the downstream.
+  // Block: refused action never reaches the downstream.
   if (!pre.allowed) {
     const reason = pre.reason ?? (pre.reasons && pre.reasons.join("; ")) ?? "policy refused";
     return blockedResponse(actionName, reason);
   }
 
-  // 4. Allowed: forward to the real downstream and relay its JSON.
+  // Allowed: forward to the real downstream and relay its JSON.
   const method = options.forwardMethod ?? req.method ?? "POST";
   const headers: Record<string, string> = {
     "content-type": "application/json",
