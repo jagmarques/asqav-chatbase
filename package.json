@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Asqav proxy connector for Chatbase Custom Actions - sign and gate actions before they run",
   "keywords": ["asqav", "chatbase", "custom-actions", "ai-governance", "audit-trail"],
-  "license": "MIT",
+  "license": "Elastic-2.0",
   "author": "Asqav <info@asqav.com>",
   "homepage": "https://asqav.com",
   "repository": { "type": "git", "url": "https://github.com/jagmarques/asqav-chatbase.git" },
