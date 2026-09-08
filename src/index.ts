@@ -4,10 +4,8 @@
  * Chatbase Custom Actions call a developer-defined HTTPS endpoint with the
  * variables the agent collected from the user, and expect a JSON response
  * (max 20KB). This connector is that endpoint. It signs the intended action
- * through Asqav before anything runs, and only then forwards the call to the
- * real downstream URL. If Asqav refuses, the downstream is never called and a
- * blocked JSON response is returned: stop a rogue agent before it acts, and
- * prove what it tried.
+ * through Asqav before forwarding to the downstream URL. Explicit refusals
+ * block forwarding. A configured transport fallback may forward without a receipt.
  *
  * The handler holds the real downstream credentials, so it first verifies an
  * operator-set shared secret on the inbound request. An unverified caller is
@@ -29,8 +27,8 @@
  *
  * Because Chatbase does not pin a fixed request schema (you choose method,
  * headers, and which variables travel), this handler is transport-agnostic:
- * it signs whatever JSON body arrives and forwards it verbatim to the
- * configured downstream.
+ * it snapshots a JSON object for signing and body-bearing downstream requests.
+ * GET and HEAD require an empty input object; inbound URL variables are not forwarded.
  */
 
 import { createHash, timingSafeEqual } from "node:crypto";
@@ -44,7 +42,7 @@ export interface ChatbaseRequest {
   /** Headers Chatbase sent (lower-cased keys recommended). */
   headers?: Record<string, string | string[] | undefined>;
   /** The parsed JSON body: the variables the agent collected from the user. */
-  body?: Record<string, unknown>;
+  body?: unknown;
 }
 
 /** A framework-agnostic JSON response this handler produces. Serialize
@@ -103,11 +101,12 @@ export interface AsqavChatbaseOptions {
    * When true (default), a signing transport error blocks the action
    * (fail-closed). A proxy connector sits on the action path, so the safe
    * default is to refuse when governance is unreachable. Set false to
-   * fail-open and forward anyway.
+   * forward only after an SDK network failure (APIError with statusCode 0).
+   * HTTP responses and local signing refusals always block.
    */
   failClosed?: boolean;
   /** Error sink for signing transport errors. Defaults to `console.warn`. */
-  onError?: (err: unknown, ctx: { actionName: string }) => void;
+  onError?: (err: unknown, ctx: { actionName: string }) => void | Promise<void>;
   /** Injectable fetch for testing. Defaults to global `fetch`. */
   fetchImpl?: typeof fetch;
 }
@@ -121,6 +120,56 @@ export interface GuardDecision {
 function defaultOnError(err: unknown, ctx: { actionName: string }): void {
   // eslint-disable-next-line no-console
   console.warn(`[asqav/chatbase] sign failed for action '${ctx.actionName}':`, err);
+}
+
+function reportError(options: AsqavChatbaseOptions, err: unknown, actionName: string): void {
+  try {
+    const pending = (options.onError ?? defaultOnError)(err, { actionName });
+    void Promise.resolve(pending).catch(() => undefined);
+  } catch {
+    // An error sink cannot change the action decision or response.
+  }
+}
+
+function isTransportError(err: unknown): boolean {
+  // SDK module formats have different class identities; both expose these fields.
+  return err instanceof Error && err.name === "APIError"
+    && "statusCode" in err && err.statusCode === 0;
+}
+
+function snapshotInput(input: unknown): string {
+  const value = input === undefined ? {} : input;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("input must be a JSON object");
+  }
+  const text = JSON.stringify(value, (_key, item: unknown) => {
+    if (["undefined", "function", "symbol", "bigint"].includes(typeof item)
+      || (typeof item === "number" && !Number.isFinite(item))) {
+      throw new Error("input contains a non-JSON value");
+    }
+    return item;
+  });
+  const parsed: unknown = JSON.parse(text);
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("input must serialize to a JSON object");
+  }
+  return text;
+}
+
+async function downstreamResponse(response: Response, actionName: string): Promise<ChatbaseResponse> {
+  const text = await response.text();
+  let json: unknown;
+  try {
+    json = text ? JSON.parse(text) : {};
+  } catch {
+    json = { raw: text };
+  }
+  const body = json !== null && typeof json === "object" && !Array.isArray(json)
+    ? json as Record<string, unknown> : { data: json };
+  if (Buffer.byteLength(JSON.stringify(body), "utf8") > 20_000) {
+    return { status: 502, body: { blocked: false, error: "downstream_response_too_large", action: actionName } };
+  }
+  return { status: [204, 205, 304].includes(response.status) ? 200 : response.status, body };
 }
 
 /** Default header carrying the inbound shared secret. */
@@ -174,11 +223,10 @@ function verifyInbound(
   req: ChatbaseRequest,
   options: AsqavChatbaseOptions,
   actionName: string,
-  onError: (err: unknown, ctx: { actionName: string }) => void,
 ): ChatbaseResponse | null {
   const secret = options.inboundSecret ?? process.env.ASQAV_CHATBASE_INBOUND_SECRET;
   if (!secret) {
-    onError(new Error("inbound verification secret not configured"), { actionName });
+    reportError(options, new Error("inbound verification secret not configured"), actionName);
     return {
       status: 500,
       body: {
@@ -209,20 +257,19 @@ async function runPreflight(
   opts: AsqavChatbaseOptions,
   actionType: string,
   body: Record<string, unknown>,
-): Promise<GuardDecision> {
+): Promise<{ allowed: boolean; reason: string }> {
+  let decision: GuardDecision;
   if (opts.preflight) {
-    return opts.preflight(actionType, body);
-  }
-  try {
+    decision = await opts.preflight(actionType, body);
+  } else {
     const result = await opts.agent.preflight(actionType);
-    return {
-      allowed: result.cleared,
-      reason: result.cleared ? undefined : result.explanation,
-      reasons: result.reasons,
-    };
-  } catch {
-    return { allowed: true };
+    decision = { allowed: result.cleared, reason: result.cleared ? undefined : result.explanation, reasons: result.reasons };
   }
+  const allowed = decision?.allowed;
+  if (typeof allowed !== "boolean") throw new Error("invalid preflight decision");
+  const reason = allowed ? "" : decision.reason ?? (decision.reasons && decision.reasons.join("; ")) ?? "policy refused";
+  if (typeof reason !== "string") throw new Error("invalid preflight refusal reason");
+  return { allowed, reason };
 }
 
 /**
@@ -237,46 +284,63 @@ export async function handleChatbaseAction(
   req: ChatbaseRequest,
   options: AsqavChatbaseOptions,
 ): Promise<ChatbaseResponse> {
+  req = req ?? {};
+  options = { ...options, downstreamHeaders: { ...options.downstreamHeaders } };
   const actionName = options.actionName ?? "chatbase_action";
   const actionType = `chatbase:action:${actionName}`;
-  const body = req.body ?? {};
-  const onError = options.onError ?? defaultOnError;
   const fetchImpl = options.fetchImpl ?? fetch;
-  const failClosed = options.failClosed !== false;
 
   // Verify the inbound caller before any preflight, signing, or forward.
   //    An unverified caller is refused here and never reaches the downstream.
-  const rejected = verifyInbound(req, options, actionName, onError);
+  const rejected = verifyInbound(req, options, actionName);
   if (rejected) return rejected;
 
+  let bodyText: string;
+  let method: string;
+  try {
+    method = (options.forwardMethod ?? req.method ?? "POST").toUpperCase();
+    bodyText = snapshotInput(req.body);
+    if (!["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"].includes(method)
+      || (["GET", "HEAD"].includes(method) && Object.keys(JSON.parse(bodyText)).length > 0)) {
+      throw new Error("unsupported method or nonempty GET/HEAD input");
+    }
+  } catch (err) {
+    reportError(options, err, actionName);
+    return { status: 400, body: { blocked: true, error: "invalid_input", action: actionName } };
+  }
+
   // Optional preflight: a hard deny blocks before any permit signs.
-  const pre = await runPreflight(options, actionType, body);
+  let pre: Awaited<ReturnType<typeof runPreflight>>;
+  try {
+    pre = await runPreflight(options, actionType, JSON.parse(bodyText));
+  } catch (err) {
+    reportError(options, err, actionName);
+    return blockedResponse(actionName, "preflight unavailable");
+  }
 
   // Sign the intended action. The receipt records what the agent tried,
   //    before the downstream runs.
   try {
     await options.agent.sign({
       actionType,
-      context: { action_name: actionName, input: body },
+      context: { action_name: actionName, input: JSON.parse(bodyText) },
       policyDecision: pre.allowed ? "permit" : "deny",
       ...(pre.allowed ? {} : { reason: "policy_blocked" as const }),
     });
   } catch (err) {
-    onError(err, { actionName });
-    if (failClosed) {
-      return blockedResponse(actionName, "signing unavailable (fail-closed)");
+    reportError(options, err, actionName);
+    if (options.failClosed !== false || !isTransportError(err)) {
+      return blockedResponse(actionName, "signing failed");
     }
     // fail-open: fall through and forward.
   }
 
   // Block: refused action never reaches the downstream.
   if (!pre.allowed) {
-    const reason = pre.reason ?? (pre.reasons && pre.reasons.join("; ")) ?? "policy refused";
-    return blockedResponse(actionName, reason);
+    return blockedResponse(actionName, pre.reason);
   }
 
   // Allowed: forward to the real downstream and relay its JSON.
-  const method = options.forwardMethod ?? req.method ?? "POST";
   const headers: Record<string, string> = {
     "content-type": "application/json",
     ...(options.downstreamHeaders ?? {}),
@@ -287,19 +351,11 @@ export async function handleChatbaseAction(
     const downstreamRes = await fetchImpl(options.downstreamUrl, {
       method,
       headers,
-      body: sendsBody ? JSON.stringify(body) : undefined,
+      body: sendsBody ? bodyText : undefined,
     });
-    const text = await downstreamRes.text();
-    let json: Record<string, unknown>;
-    try {
-      json = text ? (JSON.parse(text) as Record<string, unknown>) : {};
-    } catch {
-      // Chatbase requires JSON; wrap a non-JSON downstream body.
-      json = { raw: text };
-    }
-    return { status: downstreamRes.status, body: json };
+    return await downstreamResponse(downstreamRes, actionName);
   } catch (err) {
-    onError(err, { actionName });
+    reportError(options, err, actionName);
     return {
       status: 502,
       body: { blocked: false, error: "downstream_unreachable", action: actionName },
@@ -353,6 +409,7 @@ export interface MinimalExpressRes {
  *     agent,
  *     actionName: "refund",
  *     downstreamUrl: "https://api.yourapp.com/refund",
+ *     inboundSecret: process.env.ASQAV_CHATBASE_INBOUND_SECRET!,
  *   }));
  */
 export function expressHandler(options: AsqavChatbaseOptions) {
@@ -361,7 +418,7 @@ export function expressHandler(options: AsqavChatbaseOptions) {
       {
         method: req.method,
         headers: req.headers,
-        body: (req.body ?? {}) as Record<string, unknown>,
+        body: req.body,
       },
       options,
     );

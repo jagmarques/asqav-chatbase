@@ -1,106 +1,113 @@
-<p align="center">
-  <a href="https://asqav.com"><img src="https://asqav.com/logo-text-white.png" alt="Asqav" width="150"></a>
-</p>
-
 # asqav-chatbase
 
-Stop a rogue agent before it acts, and prove what it tried. This package is a proxy connector for [Chatbase](https://www.chatbase.co) Custom Actions. Point a Chatbase Custom Action at it, and it signs the intended action through Asqav before forwarding to your real API. If Asqav refuses, the downstream is never called and the connector returns a blocked JSON response. Every attempt becomes a tamper-evident receipt, signed server-side with NIST FIPS 204 ML-DSA-65. The agent never holds the signing key, so it cannot forge the record.
+Gate a Chatbase Server Custom Action through an Asqav Agent before forwarding its JSON input to your API. The connector checks an inbound shared secret, runs preflight and attempts signing. An explicit refusal blocks forwarding. Only actions routed through this endpoint are covered.
 
-Asqav governs the agents you wire through it. An agent that never routes through the governed path produces no receipt and is not detected.
+A successful signing call records intent before execution. The connector does not attest the downstream result or verify a signature locally. Rejected input, authentication failures and unavailable signing can produce no receipt. The optional transport fallback can execute without a receipt.
 
-This is a sign-then-forward pre-execution gate. Signing happens before the downstream runs, so a refused action never executes.
+## Install from a local checkout
 
-## How it hooks in
+Use Node 22.12 or a later Node 22 release for the source build. The package uses the released SDK range `^0.10.10`; its runtime requires Node 20.19 through 20.x, or Node 22.12 and later.
 
-A Chatbase Custom API Action sends an HTTP request, with a method of GET, POST, PUT, or DELETE, to a developer-defined HTTPS endpoint, injecting the variables the agent collected from the user into the URL or the JSON body. Custom headers are supported, and the endpoint must return JSON up to 20KB. This connector is that endpoint: it signs the inbound action and, when allowed, forwards the same body to your real downstream URL and relays its JSON back to Chatbase.
+Place this checkout beside your application directory as `asqav-chatbase`. Run these commands from your application directory:
 
-```
-Chatbase  ->  this handler  --sign-->  Asqav
-                    |  allowed  -> forward to your real API -> relay JSON
-                    |  refused  -> return { blocked: true, ... } (no forward)
-```
-
-Reference, cold-verified: [Chatbase Custom Action docs](https://www.chatbase.co/docs/user-guides/chatbot/actions/custom-action).
-
-## Install
-
-Not yet published to npm. Install from GitHub or a local path:
-
-```bash
-npm install github:jagmarques/asqav-chatbase
+```sh
+npm ci --prefix ../asqav-chatbase
+npm install ../asqav-chatbase
+npm install express @asqav/sdk@^0.10.10
 ```
 
-```json
-{
-  "dependencies": {
-    "asqav-chatbase": "file:../asqav-chatbase",
-    "@asqav/sdk": "^0.5.5"
-  }
-}
-```
+## Configure one Agent
 
-## Quick start with Express
+Set `ASQAV_API_KEY`, `ASQAV_AGENT_ID`, `ASQAV_CHATBASE_INBOUND_SECRET` and `YOURAPP_TOKEN` in your server environment. Use an existing Agent ID from Asqav. The inbound secret is a separate shared value you also configure in Chatbase; keep the Asqav key and downstream token on your server.
 
-```ts
-import express from "express";
+Save this as `agent.mjs`:
+
+```js
 import { init, Agent } from "@asqav/sdk";
-import { expressHandler } from "asqav-chatbase";
 
-init({ apiKey: process.env.ASQAV_API_KEY! });
-const agent = await Agent.create({ name: "chatbase-bot" });
+function required(name) {
+  const value = process.env[name];
+  if (!value) throw new Error(`Missing ${name}`);
+  return value;
+}
+export const inboundSecret = required("ASQAV_CHATBASE_INBOUND_SECRET");
+export const downstreamToken = required("YOURAPP_TOKEN");
+init({ apiKey: required("ASQAV_API_KEY"), mode: "full-payload" });
+export const agent = await Agent.get(required("ASQAV_AGENT_ID"));
+```
+
+SDK 0.10.10 uses module-wide connection configuration. Keep one API key/base/mode configuration per process and do not call `init()` for another tenant or during requests. This connector accepts a prebuilt Agent; it does not provide connection isolation.
+
+## Express
+
+Save this as `server.mjs`, then run `node server.mjs`:
+
+```js
+import express from "express";
+import { expressHandler } from "asqav-chatbase";
+import { agent, inboundSecret, downstreamToken } from "./agent.mjs";
 
 const app = express();
 app.use(express.json());
-
-// Mount one route per gated action.
-app.post("/asqav/refund", expressHandler({
-  agent,
-  actionName: "refund",
+app.post("/asqav/refund", (req, res, next) => {
+  if (!req.is("application/json")) return res.status(415).json({ error: "json_required" });
+  next();
+}, expressHandler({
+  agent, inboundSecret, actionName: "refund",
   downstreamUrl: "https://api.yourapp.com/refund",
-  // headers sent to YOUR real API (not to Chatbase)
-  downstreamHeaders: { authorization: `Bearer ${process.env.YOURAPP_TOKEN}` },
+  downstreamHeaders: { authorization: `Bearer ${downstreamToken}` },
 }));
-
+app.use((err, req, res, next) => {
+  const status = err.type === "entity.parse.failed" ? 400 : err.status === 413 ? 413 : 500;
+  res.status(status).json({ error: "request_failed" });
+});
 app.listen(3000);
 ```
 
-## Point Chatbase at it
+In Chatbase, choose a **Server** Custom Action and your deployed HTTPS `/asqav/refund` endpoint. Use POST with a JSON object body containing the action variables. Set `Content-Type: application/json` and give `x-asqav-connector-secret` the same inbound secret. A custom `inboundSecretHeader` must also be configured with that exact name in Chatbase. Test a wrong-secret request and a refused action as well as a successful request.
 
-1. In your Chatbase agent, add a Custom API Action.
-2. Set the action URL to your deployed handler, for example `https://gate.yourapp.com/asqav/refund`.
-3. Set the method to `POST` and define the variables the agent collects from the user. They arrive in the JSON body.
-4. The handler signs the action, forwards the body to `downstreamUrl`, and returns the downstream JSON. A refused action returns `{ "blocked": true, ... }` so the agent sees the block.
+Chatbase documents configured headers and JSON requests/responses, with a 20KB response limit. This connector uses a conservative 20,000-byte limit on its serialized downstream response. The actual Chatbase account/workflow still needs your end-to-end test. [Custom Action documentation](https://www.chatbase.co/docs/user-guides/chatbot/actions/custom-action).
 
-## Serverless with any framework
+## Serverless POST handler
 
-Use the framework-agnostic core directly:
+Reuse the defined Agent configuration above; forward the incoming headers to the core:
 
-```ts
+```js
 import { handleChatbaseAction } from "asqav-chatbase";
+import { agent, inboundSecret, downstreamToken } from "./agent.mjs";
 
-export async function POST(request: Request) {
-  const body = await request.json();
+export async function POST(request) {
+  let body;
+  try { body = await request.json(); }
+  catch { return Response.json({ error: "invalid_json" }, { status: 400 }); }
   const result = await handleChatbaseAction(
-    { method: "POST", body },
-    { agent, actionName: "refund", downstreamUrl: "https://api.yourapp.com/refund" },
+    { method: request.method, headers: Object.fromEntries(request.headers), body },
+    { agent, inboundSecret, actionName: "refund",
+      downstreamUrl: "https://api.yourapp.com/refund",
+      downstreamHeaders: { authorization: `Bearer ${downstreamToken}` } },
   );
-  return new Response(JSON.stringify(result.body), { status: result.status });
+  return Response.json(result.body, { status: result.status });
 }
 ```
 
-## Options
+## Behavior and options
 
-`handleChatbaseAction(req, options)` and `expressHandler(options)` accept:
+`handleChatbaseAction(req, options)` and `expressHandler(options)` require `agent` and `downstreamUrl`. `actionName` defaults to `chatbase_action`; the signing action type is `chatbase:action:<name>`.
 
-- `agent`, required: a pre-built Asqav `Agent` from `@asqav/sdk`.
-- `downstreamUrl`, required: your real API this action gates.
-- `actionName`: the name on the signed receipt and the action_type suffix. Defaults to `"chatbase_action"`.
-- `forwardMethod`: method used when forwarding. Defaults to the inbound method, or `POST`.
-- `downstreamHeaders`: extra headers sent to your downstream, such as an auth token.
-- `preflight`: a custom `(actionType, body) => { allowed, reason }` check. Defaults to `agent.preflight`.
-- `failClosed`, defaulting to `true`: block the action when a signing transport error occurs. A proxy connector sits on the action path, so the safe default is to refuse when governance is unreachable. Set `false` to fail-open.
-- `onError`: sink for signing transport errors. Defaults to `console.warn`.
+`inboundSecret` defaults to `ASQAV_CHATBASE_INBOUND_SECRET`. Missing configuration returns 500; a missing, wrong or ambiguous secret header returns 401 before preflight/signing/forwarding. `inboundSecretHeader` defaults to `x-asqav-connector-secret` and is matched without case sensitivity. Incoming headers are not forwarded to your API; `downstreamHeaders` supplies its configured headers.
+
+The input must be a JSON object; an omitted body means `{}`. The connector serializes it before awaiting anything and gives custom preflight a separate copy. Caller or preflight mutations cannot change the snapshot used for signing and forwarding. Serialization errors and non-JSON values return 400. Configure only trusted SDK hooks: they can affect the signing context.
+
+`forwardMethod` overrides the incoming method, which defaults to POST. POST, PUT, PATCH, DELETE and OPTIONS forward the JSON snapshot. GET and HEAD require empty input and send no body. Incoming URL/query variables are not copied into `downstreamUrl`; configure action variables in the JSON body. The receipt input does not attest method, headers or the destination URL.
+
+`preflight(actionType, body)` can supply `{ allowed, reason?, reasons? }`; otherwise the connector uses `agent.preflight`. The connector captures the decision and refusal text before awaiting signing. A refusal attempts a deny receipt and blocks execution. A thrown preflight or missing/nonboolean `allowed` value blocks without attempting a permit. `failClosed` defaults to true. Setting it to false permits forwarding after a positive preflight only when signing throws the SDK's network `APIError` with `statusCode: 0`. HTTP responses (including 401/403/429/5xx), local validation errors and malformed signing responses still block. A network failure can leave receipt creation uncertain; do not interpret fallback as authorization.
+
+`onError(error, { actionName })` receives operational errors and defaults to `console.warn`; thrown or rejected error-sink callbacks do not change the action decision. `fetchImpl` overrides downstream fetch only. SDK traffic uses the SDK's own fetch.
+
+Downstream object JSON is returned directly; arrays, scalars and null become `{ data: ... }`, and non-JSON text becomes `{ raw: ... }`. Empty responses become `{}`; statuses 204/205/304 become 200 so JSON can be returned. Other downstream statuses are retained. Unreachable downstream or oversized serialized output returns 502 with `blocked: false`: signing/preflight allowed forwarding, but the downstream action may already have occurred. The connector does not retry that action or provide idempotency.
+
+The example's full-payload mode sends `action_name` and the captured `input` to Asqav. SDK hash-only mode sends its computed digest and permitted metadata instead; the full JSON still goes to your downstream API. Neither inbound secret nor downstream headers enters the signing context unless your own body/hooks include them. Signing has no downstream response to include.
 
 ## License
 
-MIT
+[Elastic License 2.0](LICENSE), as specified by this repository's existing terms.
