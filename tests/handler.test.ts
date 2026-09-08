@@ -2,9 +2,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import type { Agent } from "@asqav/sdk";
 import { handleChatbaseAction, expressHandler } from "../src/index.js";
 
-// Shared inbound secret used by the "happy path" tests. The connector now
-// requires it, so every request that expects to reach the downstream carries
-// the matching x-asqav-connector-secret header.
+// Successful request fixtures carry this matching inbound header
 const INBOUND_SECRET = "shared-inbound-secret";
 const AUTH_HEADERS = { "x-asqav-connector-secret": INBOUND_SECRET };
 
@@ -99,8 +97,7 @@ describe("handleChatbaseAction", () => {
 
 describe("inbound verification (confused-deputy fix)", () => {
   it("rejects with 401 and never forwards when the secret header is missing", async () => {
-    // Fail-first: before the fix this body was forwarded to the downstream with
-    // the operator credentials. The fix must refuse and never call fetch.
+    // A missing secret must block forwarding of the downstream credentials
     const { agent, sign } = mockAgent();
     const fetchImpl = okFetch({ refunded: 50 });
 
@@ -186,7 +183,7 @@ describe("inbound verification (confused-deputy fix)", () => {
   });
 
   it("fails closed with 500 and never signs or forwards when no secret is configured", async () => {
-    // A misconfigured deployment (no secret anywhere) must not silently accept.
+    // Missing configuration must refuse signing and forwarding
     vi.stubEnv("ASQAV_CHATBASE_INBOUND_SECRET", "");
     const { agent, sign } = mockAgent();
     const fetchImpl = okFetch({ should: "not happen" });
