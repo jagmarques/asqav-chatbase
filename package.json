@@ -25,9 +25,9 @@
     "test": "vitest run",
     "lint": "tsc --noEmit"
   },
-  "engines": { "node": ">=18" },
+  "engines": { "node": ">=20.19.0 <21 || >=22.12.0" },
   "dependencies": {
-    "@asqav/sdk": "^0.8.0"
+    "@asqav/sdk": "^0.10.10"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
